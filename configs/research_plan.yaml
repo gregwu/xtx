@@ -1,0 +1,25 @@
+five_minute:
+  horizons_bars: [1, 3, 6, 12]
+  primary_horizon: 6
+  sequence_length: 78
+  top_fraction_each_side: 0.02
+  assumed_roundtrip_cost_bps: 2.0
+
+daily:
+  horizons_days: [1, 3, 5, 10]
+  primary_horizon: 5
+  sequence_length: 60
+  top_fraction_each_side: 0.05
+  assumed_roundtrip_cost_bps: 5.0
+
+validation:
+  scheme: anchored_walk_forward
+  embargo: "at least max target horizon"
+  retrain_frequency_5m: monthly
+  retrain_frequency_daily: monthly
+
+model_stack:
+  baseline: lightgbm_huber_multi_horizon
+  deep: shared_transformer_multi_horizon
+  ensemble: "rank-average validated models"
+  future: "distill transformer teacher into trees/small MLP for low-latency live inference"
