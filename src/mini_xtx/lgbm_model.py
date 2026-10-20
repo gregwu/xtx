@@ -5,7 +5,8 @@ import numpy as np
 import polars as pl
 import lightgbm as lgb
 from sklearn.metrics import mean_squared_error
-from .schema import FEATURES
+from .schema import feature_columns
+
 
 def _mask_dates(df, start=None, end=None):
     x = df
@@ -16,32 +17,105 @@ def _mask_dates(df, start=None, end=None):
         x = x.filter(d <= pl.lit(end).str.to_date())
     return x
 
-def train_lgbm(
-    data: str, outdir: str,
-    train_end: str, valid_start: str, valid_end: str, test_start: str,
-):
-    out = Path(outdir); out.mkdir(parents=True, exist_ok=True)
-    df = pl.read_parquet(data).sort(["timestamp","symbol"])
-    target_cols = sorted([c for c in df.columns if c.startswith("target_")],
-                         key=lambda x: int(x.split("_")[-1]))
 
-    train = _mask_dates(df, end=train_end)
-    valid = _mask_dates(df, start=valid_start, end=valid_end)
+def _purge_tail(df: pl.DataFrame, bars: int) -> pl.DataFrame:
+    """Drop the last N rows per symbol so targets cannot cross a split boundary."""
+    if bars <= 0 or df.is_empty():
+        return df
+    return (
+        df.with_columns([
+            pl.int_range(0, pl.len()).over("symbol").alias("__row"),
+            pl.len().over("symbol").alias("__n"),
+        ])
+        .filter(pl.col("__row") < pl.col("__n") - bars)
+        .drop(["__row", "__n"])
+    )
+
+
+def _target_horizon(name: str) -> int:
+    return int(name.split("_")[-1])
+
+
+def _target_specs(columns) -> list[tuple[str, str, str]]:
+    """Return (target_column, prediction_column, model_stem) specs."""
+    specs = []
+    for c in set(columns):
+        if c.startswith("target_mfe_"):
+            h = c.split("_")[-1]
+            specs.append((c, f"pred_mfe_{h}", f"model_mfe_h{h}"))
+        elif c.startswith("target_mae_"):
+            h = c.split("_")[-1]
+            specs.append((c, f"pred_mae_{h}", f"model_mae_h{h}"))
+        elif c.startswith("target_"):
+            h = c.split("_")[-1]
+            specs.append((c, f"pred_{h}", f"model_h{h}"))
+
+    order = {"return": 0, "mfe": 1, "mae": 2}
+
+    def key(spec):
+        c = spec[0]
+        kind = "mfe" if "_mfe_" in c else "mae" if "_mae_" in c else "return"
+        return (_target_horizon(c), order[kind])
+
+    return sorted(specs, key=key)
+
+
+def train_lgbm(
+    data: str,
+    outdir: str,
+    train_end: str,
+    valid_start: str,
+    valid_end: str,
+    test_start: str,
+    purge_bars: int | None = None,
+    auxiliary_targets: bool = True,
+):
+    out = Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    df = pl.read_parquet(data).sort(["timestamp", "symbol"])
+    features = feature_columns(df.columns)
+    specs = _target_specs(df.columns)
+    if not auxiliary_targets:
+        specs = [s for s in specs if "_mfe_" not in s[0] and "_mae_" not in s[0]]
+
+    return_targets = [
+        s[0] for s in specs if "_mfe_" not in s[0] and "_mae_" not in s[0]
+    ]
+    if not return_targets:
+        raise ValueError("No return targets found")
+
+    max_h = max(map(_target_horizon, return_targets))
+    purge = max_h if purge_bars is None else purge_bars
+
+    train = _purge_tail(_mask_dates(df, end=train_end), purge)
+    valid = _purge_tail(_mask_dates(df, start=valid_start, end=valid_end), purge)
     test = _mask_dates(df, start=test_start)
 
-    pred = test.select(["symbol","timestamp"] + [c for c in test.columns if c.startswith("ret_fwd_")])
+    prediction_cols = [
+        c for c in test.columns
+        if c.startswith(("ret_fwd_", "ret_exec_fwd_", "mfe_fwd_", "mae_fwd_"))
+    ]
+    pred = test.select(["symbol", "timestamp"] + prediction_cols)
+    metrics = {
+        "_meta": {
+            "features": features,
+            "purge_bars": purge,
+            "auxiliary_targets": auxiliary_targets,
+        }
+    }
 
-    metrics = {}
-    for target in target_cols:
-        h = target.split("_")[-1]
-        cols = FEATURES + [target]
+    for target, pred_col, model_stem in specs:
+        cols = features + [target]
         tr = train.select(cols).drop_nulls()
         va = valid.select(cols).drop_nulls()
         te = test.select(cols).drop_nulls()
+        if tr.is_empty() or va.is_empty() or te.is_empty():
+            metrics[target] = {"skipped": "empty split after null filtering"}
+            continue
 
-        Xtr, ytr = tr.select(FEATURES).to_pandas(), tr[target].to_numpy()
-        Xva, yva = va.select(FEATURES).to_pandas(), va[target].to_numpy()
-        Xte, yte = te.select(FEATURES).to_pandas(), te[target].to_numpy()
+        Xtr, ytr = tr.select(features).to_pandas(), tr[target].to_numpy()
+        Xva, yva = va.select(features).to_pandas(), va[target].to_numpy()
+        Xte, yte = te.select(features).to_pandas(), te[target].to_numpy()
 
         model = lgb.LGBMRegressor(
             objective="huber",
@@ -58,29 +132,30 @@ def train_lgbm(
             n_jobs=-1,
         )
         model.fit(
-            Xtr, ytr,
+            Xtr,
+            ytr,
             eval_set=[(Xva, yva)],
-            callbacks=[lgb.early_stopping(200, verbose=False)]
+            callbacks=[lgb.early_stopping(200, verbose=False)],
         )
-        model.booster_.save_model(str(out / f"model_h{h}.txt"))
+        model.booster_.save_model(str(out / f"{model_stem}.txt"))
 
         pv = model.predict(Xva)
         pt = model.predict(Xte)
-        ic_val = np.corrcoef(pv, yva)[0,1] if len(yva) > 2 else np.nan
-        ic_test = np.corrcoef(pt, yte)[0,1] if len(yte) > 2 else np.nan
         metrics[target] = {
             "best_iteration": int(model.best_iteration_ or model.n_estimators),
             "val_mse": float(mean_squared_error(yva, pv)),
             "test_mse": float(mean_squared_error(yte, pt)),
-            "val_ic": float(ic_val),
-            "test_ic": float(ic_test),
+            "val_ic": float(np.corrcoef(pv, yva)[0, 1]) if len(yva) > 2 else np.nan,
+            "test_ic": float(np.corrcoef(pt, yte)[0, 1]) if len(yte) > 2 else np.nan,
         }
 
-        # Align predictions by symbol/timestamp, not by row assumption.
-        # Same null filter as `te`, so keys line up 1:1 with `pt`.
-        te_keys = test.select(["symbol","timestamp"] + cols).drop_nulls(cols).select(["symbol","timestamp"])
-        te_keys = te_keys.with_columns(pl.Series(f"pred_{h}", pt))
-        pred = pred.join(te_keys, on=["symbol","timestamp"], how="left")
+        te_keys = (
+            test.select(["symbol", "timestamp"] + cols)
+            .drop_nulls(cols)
+            .select(["symbol", "timestamp"])
+            .with_columns(pl.Series(pred_col, pt))
+        )
+        pred = pred.join(te_keys, on=["symbol", "timestamp"], how="left")
 
     pred.write_parquet(out / "predictions.parquet")
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
