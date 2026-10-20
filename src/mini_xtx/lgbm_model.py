@@ -77,7 +77,8 @@ def train_lgbm(
         }
 
         # Align predictions by symbol/timestamp, not by row assumption.
-        te_keys = test.select(["symbol","timestamp",target]).drop_nulls([target]).select(["symbol","timestamp"])
+        # Same null filter as `te`, so keys line up 1:1 with `pt`.
+        te_keys = test.select(["symbol","timestamp"] + cols).drop_nulls(cols).select(["symbol","timestamp"])
         te_keys = te_keys.with_columns(pl.Series(f"pred_{h}", pt))
         pred = pred.join(te_keys, on=["symbol","timestamp"], how="left")
 

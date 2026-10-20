@@ -97,6 +97,59 @@ python -m mini_xtx.cli backtest \
   --cost-bps 2.0
 ```
 
+## Example run: daily bars (2026-10-20)
+
+First end-to-end run of the pipeline on US equity daily bars (Alpaca), to check it works.
+
+Data: 532 symbols, 1.59M rows, 2014-06-02 to 2026-10-16. No `sector` column, so the sector features are zero.
+Split: train through 2023-12-31, validate on 2024, test from 2025-01-01.
+
+```bash
+python -m mini_xtx.cli build --input daily.parquet --output features_daily.parquet --freq 1d
+python -m mini_xtx.cli train-lgbm --data features_daily.parquet --outdir artifacts/lgbm_daily \
+  --train-end 2023-12-31 --valid-start 2024-01-01 --valid-end 2024-12-31 --test-start 2025-01-01
+python -m mini_xtx.cli backtest --predictions artifacts/lgbm_daily/predictions.parquet \
+  --horizon ret_fwd_10 --top-frac 0.05 --cost-bps 2.0
+```
+
+Building the features took about 3 s. Training LightGBM took about 50 s across the four horizons.
+
+### LightGBM: correlation between predictions and the vol-normalized residual target
+
+| Target | Best iteration | Validation IC | Test IC |
+|---|---|---|---|
+| `target_1` | 1 | 0.013 | 0.005 |
+| `target_3` | 1 | 0.007 | 0.014 |
+| `target_5` | 81 | 0.022 | 0.032 |
+| `target_10` | 355 | 0.031 | 0.054 |
+
+The models find no usable signal at 1 and 3 days: early stopping keeps only one tree.
+The signal gets stronger with the horizon, and the test IC is higher than the validation IC at 5 and 10 days.
+
+### Backtest (long top 5%, short bottom 5%, 2 bps cost)
+
+| Horizon | Rebalances | Mean return per rebalance | Std | Sharpe per rebalance | Mean cross-sectional IC |
+|---|---|---|---|---|---|
+| `ret_fwd_5` | 444 | 0.17% | 1.76% | 0.098 | 0.031 |
+| `ret_fwd_10` | 439 | 0.32% | 2.15% | 0.150 | 0.036 |
+
+Caveat: the backtest rebalances on every bar but holds each position for 5 or 10 days, so the holding periods overlap.
+These figures overstate an achievable return and cannot be annualized directly.
+
+### Transformer
+
+This was only a smoke run: 2 epochs, `--seq-len 20`, on a CUDA GPU (about 2 min).
+Validation loss went from 1.240 to 1.254, so the result says nothing about performance.
+`train-transformer` saves `best.pt` but does not yet write test-period predictions, so it cannot be backtested.
+
+### Fix found during the run
+
+`train-lgbm` crashed when it joined the test predictions back onto `symbol` and `timestamp`.
+The model scored test rows after dropping nulls in the features and the target, but the keys only dropped null targets.
+Both now drop nulls over the same columns.
+
+The 5-minute pipeline has not been run yet.
+
 ## Recommended production path
 
 Research:
