@@ -55,6 +55,13 @@ def backtest_ranked(
         )
     )
 
+    # IC must use the complete cross-section, not only selected tail names.
+    ic = (
+        x.group_by("timestamp")
+        .agg(pl.corr(pcol, ret_col).alias("cs_ic"))
+        .sort("timestamp")
+    )
+
     selected = x.filter(pl.col("side") != 0).with_columns([
         (pl.col("side") * pl.col(ret_col)).alias("gross_ret"),
         (pl.col("side") * pl.col(ret_col) - cost_bps / 10000.0).alias("net_ret"),
@@ -77,8 +84,8 @@ def backtest_ranked(
             .alias("short_return"),
             (pl.col("side") > 0).sum().alias("n_long"),
             (pl.col("side") < 0).sum().alias("n_short"),
-            pl.corr(pcol, ret_col).alias("cs_ic"),
         ])
+        .join(ic, on="timestamp", how="left")
         .sort("timestamp")
     )
 
