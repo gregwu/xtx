@@ -108,6 +108,9 @@ def add_targets(df: pl.DataFrame, freq: str) -> pl.DataFrame:
     - close-to-future-close residual return (research target)
     - next-open-to-future-close executable return
     - next-open MFE / MAE path targets
+
+    For 5m data, targets are null unless t+H stays in the same calendar session.
+    This prevents late-session 30m/60m labels from silently becoming overnight trades.
     """
     horizons = (1, 3, 6, 12) if freq == "5m" else (1, 3, 5, 10)
     out = df
@@ -118,12 +121,22 @@ def add_targets(df: pl.DataFrame, freq: str) -> pl.DataFrame:
         future_high = _future_extreme("high", h, "max")
         future_low = _future_extreme("low", h, "min")
         name = f"ret_fwd_{h}"
+        valid = pl.lit(True)
+        if freq == "5m":
+            valid = (
+                pl.col("timestamp").shift(-h).over("symbol").dt.date()
+                == pl.col("timestamp").dt.date()
+            )
 
         out = out.with_columns([
-            (close_fut / pl.col("close") - 1.0).alias(name),
-            (close_fut / next_open - 1.0).alias(f"ret_exec_fwd_{h}"),
-            (future_high / next_open - 1.0).alias(f"mfe_fwd_{h}"),
-            (future_low / next_open - 1.0).alias(f"mae_fwd_{h}"),
+            pl.when(valid).then(close_fut / pl.col("close") - 1.0)
+                .otherwise(None).alias(name),
+            pl.when(valid).then(close_fut / next_open - 1.0)
+                .otherwise(None).alias(f"ret_exec_fwd_{h}"),
+            pl.when(valid).then(future_high / next_open - 1.0)
+                .otherwise(None).alias(f"mfe_fwd_{h}"),
+            pl.when(valid).then(future_low / next_open - 1.0)
+                .otherwise(None).alias(f"mae_fwd_{h}"),
         ])
         out = out.with_columns(
             pl.col(name).mean().over("timestamp").alias(f"mkt_fwd_{h}")
