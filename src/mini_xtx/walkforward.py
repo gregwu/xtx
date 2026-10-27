@@ -11,7 +11,12 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .metrics import cross_sectional_metrics, tail_metrics
+from .metrics import (
+    cross_sectional_metrics,
+    decile_summary,
+    nonoverlap_sample,
+    tail_metrics,
+)
 from .schema import feature_columns
 
 
@@ -25,7 +30,8 @@ class Fold:
 def monthly_folds(df: pl.DataFrame, start: str, end: str | None = None) -> list[Fold]:
     dates = (
         df.select(pl.col("timestamp").dt.date().alias("d"))
-        .unique().sort("d")
+        .unique()
+        .sort("d")
         .filter(pl.col("d") >= pl.lit(start).str.to_date())
     )
     if end:
@@ -101,12 +107,14 @@ def run_walkforward(
     models: tuple[str, ...] = ("ridge", "lgbm"),
     purge_bars: int | None = None,
     ridge_alpha: float = 10.0,
+    eval_stride: int | None = None,
 ):
     """
     Anchored monthly walk-forward.
 
-    Each month is predicted only by models trained on dates strictly before that
-    month. The training tail is purged by the forecast horizon by default.
+    Every prediction is genuinely OOS: a month is scored only by a model trained
+    on dates before that month. The training tail is purged by H bars by default.
+    Final economic diagnostics use a non-overlapping timestamp stream by default.
     """
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
@@ -121,6 +129,7 @@ def run_walkforward(
 
     folds = monthly_folds(df, start, end)
     purge = horizon if purge_bars is None else purge_bars
+    stride = horizon if eval_stride is None else max(1, eval_stride)
     all_outputs = {m: [] for m in models}
     fold_meta = []
 
@@ -159,13 +168,22 @@ def run_walkforward(
             fold_pred = scored.select(keep).with_columns(pl.Series("prediction", pred))
             all_outputs[name].append(fold_pred)
 
+            fold_eval = nonoverlap_sample(fold_pred, stride)
             summary, _, _ = cross_sectional_metrics(
-                fold_pred, "prediction", exec_ret
+                fold_eval, "prediction", exec_ret
             )
             rec[name] = summary
         fold_meta.append(rec)
 
-    summary_all = {"horizon": horizon, "purge_bars": purge, "folds": fold_meta, "models": {}}
+    summary_all = {
+        "horizon": horizon,
+        "purge_bars": purge,
+        "eval_stride_bars": stride,
+        "overlap_avoided": stride >= horizon,
+        "folds": fold_meta,
+        "models": {},
+    }
+
     for name, chunks in all_outputs.items():
         if not chunks:
             continue
@@ -173,12 +191,20 @@ def run_walkforward(
         pcol = f"pred_{horizon}"
         pred = pred.rename({"prediction": pcol})
         pred.write_parquet(out / f"{name}_predictions.parquet")
-        metric, by_time, dec = cross_sectional_metrics(pred, pcol, exec_ret)
-        metric["tails"] = tail_metrics(pred, pcol, exec_ret)
+
+        full_metric, full_by_time, full_dec = cross_sectional_metrics(pred, pcol, exec_ret)
+        nonoverlap = nonoverlap_sample(pred, stride)
+        metric, by_time, dec = cross_sectional_metrics(nonoverlap, pcol, exec_ret)
+        metric["tails"] = tail_metrics(nonoverlap, pcol, exec_ret)
         metric["fold_count"] = len(chunks)
+        metric["full_sample"] = full_metric
         summary_all["models"][name] = metric
-        by_time.write_parquet(out / f"{name}_ic_by_time.parquet")
-        dec.write_parquet(out / f"{name}_deciles.parquet")
+
+        full_by_time.write_parquet(out / f"{name}_ic_by_time_full.parquet")
+        full_dec.write_parquet(out / f"{name}_deciles_full.parquet")
+        by_time.write_parquet(out / f"{name}_ic_by_time_nonoverlap.parquet")
+        dec.write_parquet(out / f"{name}_deciles_nonoverlap.parquet")
+        decile_summary(dec).write_parquet(out / f"{name}_decile_summary.parquet")
 
     (out / "walkforward_summary.json").write_text(json.dumps(summary_all, indent=2))
     return summary_all
