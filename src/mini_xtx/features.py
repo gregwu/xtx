@@ -76,6 +76,20 @@ def add_features(df: pl.DataFrame, freq: str) -> pl.DataFrame:
         pl.col("rel_volume_20").rank("average").over("timestamp").truediv(pl.len().over("timestamp")).alias("cs_rank_volume"),
     ])
 
+    # Rolling market beta using only information available at or before t.
+    w = 78 if freq == "5m" else 60
+    df = df.with_columns([
+        (pl.col("ret_1") * pl.col("mkt_ret_1")).rolling_mean(w).over("symbol").alias("__xy"),
+        pl.col("ret_1").rolling_mean(w).over("symbol").alias("__x"),
+        pl.col("mkt_ret_1").rolling_mean(w).over("symbol").alias("__y"),
+        (pl.col("mkt_ret_1") * pl.col("mkt_ret_1")).rolling_mean(w).over("symbol").alias("__yy"),
+    ])
+    df = df.with_columns(
+        ((pl.col("__xy") - pl.col("__x") * pl.col("__y")) /
+         (pl.col("__yy") - pl.col("__y") * pl.col("__y") + 1e-12))
+        .clip(-5, 5).alias("beta_market")
+    )
+
     if "sector" in df.columns:
         df = df.with_columns([
             pl.col("ret_1").mean().over(["timestamp", "sector"]).alias("sector_ret_1"),
@@ -90,7 +104,8 @@ def add_features(df: pl.DataFrame, freq: str) -> pl.DataFrame:
     return df.with_columns([
         (pl.col("ret_1") - pl.col("mkt_ret_1")).alias("resid_ret_1"),
         (pl.col("ret_6") - pl.col("mkt_ret_6")).alias("resid_ret_6"),
-    ])
+        (pl.col("ret_1") - pl.col("beta_market") * pl.col("mkt_ret_1")).alias("beta_resid_ret_1"),
+    ]).drop(["__xy", "__x", "__y", "__yy"])
 
 
 def _future_extreme(col: str, h: int, op: str) -> pl.Expr:
@@ -105,9 +120,12 @@ def _future_extreme(col: str, h: int, op: str) -> pl.Expr:
 def add_targets(df: pl.DataFrame, freq: str) -> pl.DataFrame:
     """
     Multi-horizon targets:
-    - close-to-future-close residual return (research target)
+    - close-to-future-close residual return
     - next-open-to-future-close executable return
     - next-open MFE / MAE path targets
+
+    5m targets are session-safe: if t+H falls on another calendar session, all
+    H-bar targets are null. This prevents late-day "60m" labels becoming overnight labels.
     """
     horizons = (1, 3, 6, 12) if freq == "5m" else (1, 3, 5, 10)
     out = df
@@ -117,21 +135,27 @@ def add_targets(df: pl.DataFrame, freq: str) -> pl.DataFrame:
         next_open = pl.col("open").shift(-1).over("symbol")
         future_high = _future_extreme("high", h, "max")
         future_low = _future_extreme("low", h, "min")
-        name = f"ret_fwd_{h}"
+        valid = pl.lit(True)
+        if freq == "5m":
+            valid = (
+                pl.col("timestamp").shift(-h).over("symbol").dt.date()
+                == pl.col("timestamp").dt.date()
+            )
 
+        name = f"ret_fwd_{h}"
         out = out.with_columns([
-            (close_fut / pl.col("close") - 1.0).alias(name),
-            (close_fut / next_open - 1.0).alias(f"ret_exec_fwd_{h}"),
-            (future_high / next_open - 1.0).alias(f"mfe_fwd_{h}"),
-            (future_low / next_open - 1.0).alias(f"mae_fwd_{h}"),
+            pl.when(valid).then(close_fut / pl.col("close") - 1.0).otherwise(None).alias(name),
+            pl.when(valid).then(close_fut / next_open - 1.0).otherwise(None).alias(f"ret_exec_fwd_{h}"),
+            pl.when(valid).then(future_high / next_open - 1.0).otherwise(None).alias(f"mfe_fwd_{h}"),
+            pl.when(valid).then(future_low / next_open - 1.0).otherwise(None).alias(f"mae_fwd_{h}"),
         ])
         out = out.with_columns(
             pl.col(name).mean().over("timestamp").alias(f"mkt_fwd_{h}")
         )
         out = out.with_columns([
             (pl.col(name) - pl.col(f"mkt_fwd_{h}")).alias(f"resid_fwd_{h}"),
-            ((pl.col(name) - pl.col(f"mkt_fwd_{h}")) / (pl.col("rv_20") + 1e-6))
-                .clip(-8, 8).alias(f"target_{h}"),
+            ((pl.col(name) - pl.col("beta_market") * pl.col(f"mkt_fwd_{h}")) /
+             (pl.col("rv_20") + 1e-6)).clip(-8, 8).alias(f"target_{h}"),
             (pl.col(f"mfe_fwd_{h}") / (pl.col("rv_20") + 1e-6))
                 .clip(0, 12).alias(f"target_mfe_{h}"),
             (pl.col(f"mae_fwd_{h}") / (pl.col("rv_20") + 1e-6))
